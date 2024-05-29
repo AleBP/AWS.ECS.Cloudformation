@@ -1,0 +1,314 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploys an ECS Service with an associated load balancer
+Parameters:
+  KeyPair:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the container
+      instances
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: Must be a valid EC2 keypair.
+  LoadBalancerSubnets:
+    Description: Subnet(s) for the load balancer
+    Type: List<AWS::EC2::Subnet::Id>
+  ECSSubnets:
+    Description: Subnets for the ECS Dre Clusters
+    Type: List<AWS::EC2::Subnet::Id>
+  VpcId:
+    Description: VPC ID for resources
+    Type: AWS::EC2::VPC::Id
+  InstanceType:
+    Description: Dre Clusters EC2 instance type
+    Type: String
+    Default: t3a.small
+    AllowedValues:
+    - t3a.micro
+    - t3a.small
+    ConstraintDescription: must be a valid EC2 instance type.
+  DesiredCapacity:
+    Type: Number
+    Default: 1
+    Description: Number of instances to launch in your ECS cluster.
+  MaxSize:
+    Type: Number
+    Description: Maximum number of instances that can be launched in your ECS cluster.
+    Default: 2
+  MinSize:
+    Type: Number
+    Description: Minimum number of instances that can be launched in your ECS cluster.
+    Default: 1
+  Owner:
+    Description: Used to tag resources
+    Type: String
+  healthCheckType:
+    Description: ALB Healthcheck Type.
+    Type: String
+    Default: EC2
+    AllowedValues:
+      - EC2
+      - ELB
+  LaunchTemplateVersionNumber:
+    Type: Number
+    Description: Si
+    Default: 1
+  ISize:
+    Description: Instance Volume Size.
+    Type: String
+    Default: 100
+  AmiID:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Description: Query for the latest Amazon Linux AMI IDs using AWS Systems Manager Parameter Store
+    Default: '/aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id'
+
+Resources:
+  ECSCluster:
+    Type: "AWS::ECS::Cluster"
+    Properties:
+      ClusterName: !Ref Owner
+  EC2InstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Roles:
+        - !Ref ContainerServiceRole
+  ContainerServiceRole:
+    Type: AWS::IAM::Role
+    Properties: 
+        AssumeRolePolicyDocument: 
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: [ec2.amazonaws.com]
+              Action: ['sts:AssumeRole']
+        Path: /
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/AmazonSSMFullAccess
+          - arn:aws:iam::aws:policy/CloudWatchFullAccess
+          - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+          - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforAWSCodeDeploy
+        Policies:
+          - PolicyName: !Sub ${Owner}-sts-assume-role
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                -
+                  Effect: "Allow"
+                  Action:
+                    - "sts:*"
+                  Resource: "*"         
+          - PolicyName: "ecs-ec2-policy"
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: "Allow"
+                  Action:
+                    - "ecs:CreateCluster"
+                    - "ecs:DeregisterContainerInstance"
+                    - "ecs:DiscoverPollEndpoint"
+                    - "ecs:Poll"
+                    - "ecs:RegisterContainerInstance"
+                    - "ecs:StartTelemetrySession"
+                    - "ecs:Submit*"
+                    - "logs:CreateLogStream"
+                    - "logs:PutLogEvents"
+                  Resource: "*"
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchTemplate: !
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !Ref LaunchTemplateVersionNumber
+      VPCZoneIdentifier: !Ref ECSSubnets
+      DesiredCapacity: !Ref DesiredCapacity
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      HealthCheckType: !Ref healthCheckType 
+      HealthCheckGracePeriod: 240
+
+### SCALING POLICIES         
+  ScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      Cooldown: 60
+      ScalingAdjustment: 1
+
+  ScaleDownPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      Cooldown: 60
+      ScalingAdjustment: -1
+
+
+  LaunchTemplate:
+    Type: 'AWS::EC2::LaunchTemplate'
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-auto-scaling-launch-template'
+      LaunchTemplateData:
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups:
+              - !Ref ContainerInstancesSecurityGroup
+        BlockDeviceMappings:
+          - DeviceName: "/dev/xvda"
+            Ebs: 
+              VolumeSize: !Ref ISize 
+              VolumeType: "gp3"
+        Placement:
+          Tenancy: default
+        ImageId: !Ref AmiID
+        KeyName: !Ref KeyPair
+        IamInstanceProfile: 
+          Name: !Ref EC2InstanceProfile
+        InstanceType: !Ref InstanceType
+        UserData:
+          Fn::Base64:
+            !Sub |
+              #!/bin/bash
+              yum update && yum upgrade -y
+              yum install nano awscli -y
+              yum install git -y
+              echo "ECS_CLUSTER=${ECSCluster}" > /etc/ecs/ecs.config
+
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ECSCluster
+      ServiceName: caddy-service
+      TaskDefinition: !Ref CaddyTaskDefinition
+      DesiredCount: !Ref MinSize
+      LaunchType: EC2
+      LoadBalancers:
+        - ContainerName: "caddy-container"
+          ContainerPort: 80
+          TargetGroupArn: !Ref caddyTargetGroup
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref ContainerInstancesSecurityGroup
+          Subnets: !Ref ECSSubnets
+
+  CaddyTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: caddy-task
+      Cpu: 256
+      Memory: 512
+      NetworkMode: awsvpc 
+      ContainerDefinitions:
+        - Name: caddy-container
+          Image: caddy:latest
+          PortMappings:
+            - ContainerPort: 80
+
+  ContainerInstancesSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "ECS instance security group"
+      SecurityGroupIngress:
+        - IpProtocol: "tcp"
+          FromPort: 22
+          ToPort: 22
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: "tcp"
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: "tcp"
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+      VpcId: !Ref VpcId
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the ApplicationLoadBalancer
+      VpcId:
+        Ref: VpcId
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 0.0.0.0/0
+      Tags:
+      - Key: Name
+        Value: ecs-inbound-access-to-loadbalancer
+      - Key: Owner
+        Value:
+          Ref: Owner
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      SecurityGroups:
+      - Ref: LoadBalancerSecurityGroup
+      Subnets:
+        Ref: LoadBalancerSubnets
+      Tags:
+      - Key: Owner
+        Value:
+          Ref: Owner
+
+  ApplicationLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn:
+          Ref: caddyTargetGroup
+      LoadBalancerArn:
+        Ref: ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  caddyTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn:
+    - ApplicationLoadBalancer
+    Properties:
+      HealthCheckIntervalSeconds: 6
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      TargetType: ip
+      Port: 80
+      Protocol: HTTP
+      VpcId:
+        Ref: VpcId
+      Tags:
+      - Key: Name
+        Value: alb-null-target-group
+
+Outputs:
+  Cluster:
+    Description: The created ECS cluster
+    Value:
+      Ref: ECSCluster
+  Listener:
+    Description: ApplicationLoadBalancer Listener
+    Value:
+      Ref: ApplicationLoadBalancerListener
+  ApplicationLoadBalancerEndpoint:
+    Description: DNS name of the ApplicationLoadBalancer
+    Value:
+      Fn::GetAtt:
+      - ApplicationLoadBalancer
+      - DNSName
+  SecurityGroup:
+    Description: Security Group GroupID of the ECS instances
+    Value:
+      Fn::GetAtt:
+      - ContainerInstancesSecurityGroup
+      - GroupId
+  EC2InstanceProfile: 
+    Description: IAM role for the instance 
+    Value: !Ref EC2InstanceProfile
