@@ -16,7 +16,7 @@ Parameters:
     Description: VPC ID for resources
     Type: AWS::EC2::VPC::Id
   InstanceType:
-    Description: Dre Clusters EC2 instance type
+    Description: Clusters EC2 instance type
     Type: String
     Default: t3a.small
     AllowedValues:
